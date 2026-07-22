@@ -49,6 +49,7 @@ def generate_gbp_posts(request: ArticleRequest):
     - Post 1: Enfoque informativo/educativo. Destaca un problema o dato clave del artículo.
     - Post 2: Enfoque directo a la conversión/oferta. Invita a la acción clara para contactar o contratar.
     - Mantén los textos concisos, con gancho inicial, emojis relevantes y optimizados para búsquedas locales usando las keywords indicadas.
+    - Texto humanizado
 
     Palabras Clave Objetivo: {request.target_keywords}
     Contenido del Artículo:
