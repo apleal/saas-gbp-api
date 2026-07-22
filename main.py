@@ -1,20 +1,14 @@
 import os
-import json
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-import google.generativeai as genai
+import httpx
 
 app = FastAPI(title="SaaS GBP API")
 
-# Configurar la API Key de Gemini
-genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
-
-# Modelo de datos para la solicitud
 class ArticleRequest(BaseModel):
     article_content: str
     target_keywords: str
 
-# Modelo para la respuesta estructurada
 class GBPPost(BaseModel):
     post_type: str
     post_text: str
@@ -30,10 +24,13 @@ def home():
     return {"mensaje": "API de Python lista y funcionando en Easypanel"}
 
 @app.post("/api/v1/generate-gbp-posts", response_model=GBPPostsResponse)
-def generate_gbp_posts(request: ArticleRequest):
-    """
-    Recibe el contenido de un blog y sus keywords para generar 2 posts optimizados para GBP.
-    """
+async def generate_gbp_posts(request: ArticleRequest):
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=500, detail="Falta la variable GEMINI_API_KEY en Easypanel")
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
+
     prompt = f"""
     Eres un experto en SEO Local y copywriting para Google Business Profile (GBP).
     A partir del siguiente artículo de blog y palabras clave, crea EXACTAMENTE 2 publicaciones para Google Business Profile.
@@ -48,19 +45,51 @@ def generate_gbp_posts(request: ArticleRequest):
     {request.article_content}
     """
 
-    try:
-        # Configurar modelo Gemini 1.5 Flash indicando respuesta JSON estricta
-        model = genai.GenerativeModel(
-            model_name="gemini-1.5-flash",
-            generation_config={"response_mime_type": "application/json", "response_schema": GBPPostsResponse}
-        )
-        
-        response = model.generate_content(prompt)
-        
-        # Parsear el resultado JSON devuelto por Gemini
-        result_json = json.loads(response.text)
-        return result_json
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "responseSchema": {
+                "type": "OBJECT",
+                "properties": {
+                    "post_1": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "post_type": {"type": "STRING"},
+                            "post_text": {"type": "STRING"},
+                            "call_to_action_type": {"type": "STRING"},
+                            "suggested_cta_url": {"type": "STRING"}
+                        },
+                        "required": ["post_type", "post_text", "call_to_action_type", "suggested_cta_url"]
+                    },
+                    "post_2": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "post_type": {"type": "STRING"},
+                            "post_text": {"type": "STRING"},
+                            "call_to_action_type": {"type": "STRING"},
+                            "suggested_cta_url": {"type": "STRING"}
+                        },
+                        "required": ["post_type", "post_text", "call_to_action_type", "suggested_cta_url"]
+                    }
+                },
+                "required": ["post_1", "post_2"]
+            }
+        }
+    }
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error procesando con IA: {str(e)}")
+    async with httpx.AsyncClient() as client:
+        response = await client.post(url, json=payload, timeout=30.0)
+        
+        if response.status_code != 200:
+            raise HTTPException(status_code=response.status_code, detail=f"Error en Google API: {response.text}")
+        
+        data = response.json()
+        try:
+            # Extraer la respuesta JSON devuelta por Gemini
+            text_response = data["candidates"][0]["content"]["parts"][0]["text"]
+            import json
+            return json.loads(text_response)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Error al parsear respuesta: {str(e)}")
         
