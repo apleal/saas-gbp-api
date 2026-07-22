@@ -1,24 +1,24 @@
 import os
+import json
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from google import genai
-from google.genai import types
+import google.generativeai as genai
 
 app = FastAPI(title="SaaS GBP API")
 
-# Inicializar cliente de Gemini usando variable de entorno GEMINI_API_KEY
-client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+# Configurar la API Key de Gemini
+genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
 
 # Modelo de datos para la solicitud
 class ArticleRequest(BaseModel):
     article_content: str
     target_keywords: str
 
-# Modelo para la respuesta estructurada de la IA
+# Modelo para la respuesta estructurada
 class GBPPost(BaseModel):
-    post_type: str  # "Educativo/Informativo" o "Oferta/Directo"
+    post_type: str
     post_text: str
-    call_to_action_type: str  # ej: "LEARN_MORE", "CALL", "BOOK"
+    call_to_action_type: str
     suggested_cta_url: str
 
 class GBPPostsResponse(BaseModel):
@@ -49,15 +49,18 @@ def generate_gbp_posts(request: ArticleRequest):
     """
 
     try:
-        response = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=GBPPostsResponse,
-            ),
+        # Configurar modelo Gemini 1.5 Flash indicando respuesta JSON estricta
+        model = genai.GenerativeModel(
+            model_name="gemini-1.5-flash",
+            generation_config={"response_mime_type": "application/json", "response_schema": GBPPostsResponse}
         )
-        return response.parsed
+        
+        response = model.generate_content(prompt)
+        
+        # Parsear el resultado JSON devuelto por Gemini
+        result_json = json.loads(response.text)
+        return result_json
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error procesando con IA: {str(e)}")
         
