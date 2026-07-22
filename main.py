@@ -60,3 +60,4 @@ def generate_gbp_posts(request: ArticleRequest):
         return response.parsed
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error procesando con IA: {str(e)}")
+        
