@@ -7,7 +7,7 @@ from google.genai import types
 
 app = FastAPI(title="SaaS GBP API")
 
-# Inicializar cliente oficial de Gemini
+# Inicializar cliente oficial
 client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 
 class ArticleRequest(BaseModel):
@@ -28,6 +28,17 @@ class GBPPostsResponse(BaseModel):
 def home():
     return {"mensaje": "API de Python lista y funcionando en Easypanel"}
 
+@app.get("/api/v1/models")
+def list_available_models():
+    """
+    Lista todos los modelos a los que tu API Key tiene acceso actualmente.
+    """
+    try:
+        models = [m.name for m in client.models.list()]
+        return {"modelos_disponibles": models}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/api/v1/generate-gbp-posts", response_model=GBPPostsResponse)
 def generate_gbp_posts(request: ArticleRequest):
     prompt = f"""
@@ -45,15 +56,15 @@ def generate_gbp_posts(request: ArticleRequest):
     """
 
     try:
+        # Usamos el identificador estándar gemini-2.0-flash
         response = client.models.generate_content(
-            model='gemini-2.5-flash',
+            model='gemini-2.0-flash',
             contents=prompt,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
                 response_schema=GBPPostsResponse,
             ),
         )
-        # Parsear la respuesta JSON devuelta por Gemini
         return json.loads(response.text)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error procesando con IA: {str(e)}")
