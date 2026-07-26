@@ -29,17 +29,24 @@
     </section>
 
     <section id="dashboard" class="hidden grid gap-6 lg:grid-cols-[360px_1fr]">
-      <form id="ficha-form" class="h-fit space-y-3 rounded-2xl bg-slate-900 p-5">
-        <h2 class="text-xl font-semibold">Nueva ficha</h2>
-        <input name="nombre_negocio" required placeholder="Nombre del negocio" class="field">
-        <input name="categoria" required placeholder="Categoría" class="field">
-        <input name="ciudad" required placeholder="Ciudad" class="field">
-        <input name="gemini_api_key" required type="password" placeholder="Gemini API key" class="field">
-        <textarea name="prompt_custom" placeholder="Prompt personalizado (opcional)" class="field"></textarea>
-        <textarea name="gbp_auth_token" placeholder="Token GBP (opcional)" class="field"></textarea>
-        <button class="w-full rounded-lg bg-sky-500 px-4 py-3 font-semibold text-slate-950">Crear ficha</button>
-        <p class="text-xs text-slate-400">Máximo 5 fichas por cuenta.</p>
-      </form>
+      <div class="h-fit space-y-4 rounded-2xl bg-slate-900 p-5">
+        <div>
+          <h2 class="text-xl font-semibold">Importar negocios</h2>
+          <p class="mt-1 text-sm text-slate-400">Conecta la cuenta que administra tus perfiles de Google.</p>
+        </div>
+        <button id="google-connect" class="w-full rounded-lg bg-white px-4 py-3 font-semibold text-slate-950">
+          Conectar con Google
+        </button>
+        <form id="import-form" class="hidden space-y-3">
+          <div id="google-locations" class="max-h-72 space-y-2 overflow-y-auto"></div>
+          <input name="gemini_api_key" required type="password" placeholder="Gemini API key" class="field">
+          <textarea name="prompt_custom" placeholder="Prompt personalizado (opcional)" class="field"></textarea>
+          <button class="w-full rounded-lg bg-sky-500 px-4 py-3 font-semibold text-slate-950">
+            Importar seleccionadas
+          </button>
+        </form>
+        <p class="text-xs text-slate-400">Puedes importar un máximo de 5 ubicaciones.</p>
+      </div>
       <div>
         <p id="message" class="mb-4 hidden rounded-lg p-3"></p>
         <div id="fichas" class="grid gap-4 sm:grid-cols-2"></div>
@@ -77,7 +84,8 @@
           ? fichas.map(f => `<article class="rounded-2xl bg-slate-900 p-5">
               <h3 class="font-semibold">${escapeHtml(f.nombre_negocio)}</h3>
               <p class="text-sm text-slate-400">${escapeHtml(f.categoria)} · ${escapeHtml(f.ciudad)}</p>
-              <p class="mt-3 text-xs text-slate-500">Gemini: ${f.tiene_gemini_api_key ? "configurado" : "pendiente"}</p>
+              ${f.direccion ? `<p class="mt-2 text-xs text-slate-500">${escapeHtml(f.direccion)}</p>` : ""}
+              <p class="mt-3 text-xs text-slate-500">Google: ${f.google_conectada ? "conectado" : "pendiente"} · Gemini: ${f.tiene_gemini_api_key ? "configurado" : "pendiente"}</p>
             </article>`).join("")
           : '<p class="text-slate-400">Todavía no tienes fichas.</p>';
       } catch (error) {
@@ -95,7 +103,10 @@
       auth.classList.toggle("hidden", Boolean(state.token));
       dashboard.classList.toggle("hidden", !state.token);
       document.querySelector("#logout").classList.toggle("hidden", !state.token);
-      if (state.token) loadFichas();
+      if (state.token) {
+        loadFichas();
+        loadGoogleStatus();
+      }
     }
 
     function logout() {
@@ -128,15 +139,62 @@
       }
     });
 
-    document.querySelector("#ficha-form").addEventListener("submit", async event => {
+    async function loadGoogleStatus() {
+      try {
+        const status = await api("/api/v1/google/status");
+        if (status.connected) await loadGoogleLocations();
+      } catch (error) {
+        showMessage(error.message, true);
+      }
+    }
+
+    async function loadGoogleLocations() {
+      const button = document.querySelector("#google-connect");
+      button.textContent = "Actualizar conexión con Google";
+      try {
+        const locations = await api("/api/v1/google/locations");
+        const container = document.querySelector("#google-locations");
+        container.innerHTML = locations.length
+          ? locations.map((location, index) => `<label class="flex cursor-pointer gap-3 rounded-lg border border-slate-700 p-3">
+              <input type="checkbox" name="location" value="${index}" class="mt-1">
+              <span>
+                <strong class="block">${escapeHtml(location.title)}</strong>
+                <small class="text-slate-400">${escapeHtml(location.address || location.category || "")}</small>
+              </span>
+            </label>`).join("")
+          : '<p class="text-sm text-slate-400">Google no devolvió ubicaciones administrables.</p>';
+        container.dataset.locations = JSON.stringify(locations);
+        document.querySelector("#import-form").classList.remove("hidden");
+      } catch (error) {
+        showMessage(error.message, true);
+      }
+    }
+
+    document.querySelector("#google-connect").addEventListener("click", async () => {
+      try {
+        const data = await api("/api/v1/google/connect");
+        window.location.href = data.authorization_url;
+      } catch (error) {
+        showMessage(error.message, true);
+      }
+    });
+
+    document.querySelector("#import-form").addEventListener("submit", async event => {
       event.preventDefault();
       const form = new FormData(event.currentTarget);
-      const payload = Object.fromEntries(form.entries());
-      for (const key of ["prompt_custom", "gbp_auth_token"]) if (!payload[key]) payload[key] = null;
+      const allLocations = JSON.parse(document.querySelector("#google-locations").dataset.locations || "[]");
+      const selected = form.getAll("location").map(index => allLocations[Number(index)]);
+      if (!selected.length) return showMessage("Selecciona al menos una ubicación", true);
       try {
-        await api("/api/v1/fichas", { method: "POST", body: JSON.stringify(payload) });
-        event.currentTarget.reset();
-        showMessage("Ficha creada correctamente");
+        await api("/api/v1/google/import", {
+          method: "POST",
+          body: JSON.stringify({
+            locations: selected,
+            gemini_api_key: form.get("gemini_api_key"),
+            prompt_custom: form.get("prompt_custom") || null
+          })
+        });
+        showMessage("Negocios y reseñas importados correctamente");
         await loadFichas();
       } catch (error) {
         showMessage(error.message, true);
@@ -144,6 +202,8 @@
     });
 
     document.querySelector("#logout").addEventListener("click", logout);
+    const googleResult = new URLSearchParams(location.search).get("google");
+    if (googleResult) history.replaceState({}, "", "/");
     render();
   </script>
 </body>

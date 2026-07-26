@@ -1,10 +1,14 @@
 import json
 import os
+from urllib.parse import urlencode
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated, Generator
 
-from fastapi import Depends, FastAPI, HTTPException, status
+import httpx
+from cryptography.fernet import Fernet, InvalidToken
+from fastapi import Depends, FastAPI, HTTPException, Query, status
+from fastapi.responses import RedirectResponse
 from fastapi.security import OAuth2PasswordBearer
 from fastapi.staticfiles import StaticFiles
 from google import genai
@@ -37,6 +41,11 @@ if not JWT_SECRET_KEY:
 JWT_ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "1440"))
 MAX_FICHAS_PER_USER = 5
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
+GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI")
+TOKEN_ENCRYPTION_KEY = os.getenv("TOKEN_ENCRYPTION_KEY")
+GOOGLE_OAUTH_SCOPE = "https://www.googleapis.com/auth/business.manage"
 
 connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
 engine = create_engine(DATABASE_URL, pool_pre_ping=True, connect_args=connect_args)
@@ -56,6 +65,22 @@ class User(Base):
     fecha_creacion = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     fichas = relationship("FichaGBP", back_populates="owner")
+    google_connection = relationship(
+        "GoogleConnection", back_populates="user", uselist=False, cascade="all, delete-orphan"
+    )
+
+
+class GoogleConnection(Base):
+    __tablename__ = "google_connections"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), unique=True, nullable=False, index=True)
+    encrypted_refresh_token = Column(Text, nullable=False)
+    scopes = Column(Text, nullable=True)
+    fecha_conexion = Column(DateTime, default=datetime.utcnow, nullable=False)
+    fecha_actualizacion = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    user = relationship("User", back_populates="google_connection")
 
 
 class FichaGBP(Base):
@@ -69,10 +94,18 @@ class FichaGBP(Base):
     gemini_api_key = Column(String(255), nullable=False)
     prompt_custom = Column(Text, nullable=True)
     gbp_auth_token = Column(Text, nullable=True)
+    google_account_name = Column(String(255), nullable=True)
+    google_location_name = Column(String(255), nullable=True)
+    direccion = Column(Text, nullable=True)
+    telefono = Column(String(100), nullable=True)
+    sitio_web = Column(Text, nullable=True)
+    google_data = Column(Text, nullable=True)
+    fecha_sincronizacion = Column(DateTime, nullable=True)
     fecha_creacion = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     owner = relationship("User", back_populates="fichas")
     posts = relationship("PostRecord", back_populates="ficha", cascade="all, delete-orphan")
+    reviews = relationship("ReviewRecord", back_populates="ficha", cascade="all, delete-orphan")
 
 
 class PostRecord(Base):
@@ -86,6 +119,22 @@ class PostRecord(Base):
     fecha_creacion = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     ficha = relationship("FichaGBP", back_populates="posts")
+
+
+class ReviewRecord(Base):
+    __tablename__ = "reviews_gbp"
+
+    id = Column(Integer, primary_key=True)
+    ficha_id = Column(Integer, ForeignKey("fichas_gbp.id"), nullable=False, index=True)
+    google_review_id = Column(String(255), nullable=False)
+    reviewer_name = Column(String(255), nullable=True)
+    star_rating = Column(String(30), nullable=True)
+    comment = Column(Text, nullable=True)
+    review_reply = Column(Text, nullable=True)
+    create_time = Column(DateTime(timezone=True), nullable=True)
+    update_time = Column(DateTime(timezone=True), nullable=True)
+
+    ficha = relationship("FichaGBP", back_populates="reviews")
 
 
 class UserRegister(BaseModel):
@@ -130,7 +179,32 @@ class FichaResponse(BaseModel):
     prompt_custom: str | None
     tiene_gemini_api_key: bool
     tiene_gbp_auth_token: bool
+    google_conectada: bool
+    direccion: str | None
+    telefono: str | None
+    sitio_web: str | None
+    fecha_sincronizacion: datetime | None
     fecha_creacion: datetime
+
+
+class GoogleConnectionStatus(BaseModel):
+    connected: bool
+
+
+class GoogleLocationCandidate(BaseModel):
+    account_name: str
+    location_name: str
+    title: str
+    address: str | None = None
+    phone: str | None = None
+    website: str | None = None
+    category: str | None = None
+
+
+class GoogleImportRequest(BaseModel):
+    locations: list[GoogleLocationCandidate] = Field(min_length=1, max_length=5)
+    gemini_api_key: str = Field(min_length=1, max_length=255)
+    prompt_custom: str | None = None
 
 
 class ArticleRequest(BaseModel):
@@ -166,6 +240,193 @@ def create_access_token(user_id: int) -> str:
     return jwt.encode({"sub": str(user_id), "exp": expires}, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
 
 
+def require_google_settings() -> None:
+    missing = [
+        name
+        for name, value in {
+            "GOOGLE_CLIENT_ID": GOOGLE_CLIENT_ID,
+            "GOOGLE_CLIENT_SECRET": GOOGLE_CLIENT_SECRET,
+            "GOOGLE_REDIRECT_URI": GOOGLE_REDIRECT_URI,
+            "TOKEN_ENCRYPTION_KEY": TOKEN_ENCRYPTION_KEY,
+        }.items()
+        if not value
+    ]
+    if missing:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Faltan variables de Google en el servidor: {', '.join(missing)}",
+        )
+
+
+def token_cipher() -> Fernet:
+    require_google_settings()
+    try:
+        return Fernet(TOKEN_ENCRYPTION_KEY.encode())
+    except (ValueError, AttributeError) as exc:
+        raise HTTPException(
+            status_code=503, detail="TOKEN_ENCRYPTION_KEY no es una clave Fernet válida"
+        ) from exc
+
+
+def google_access_token(connection: GoogleConnection) -> str:
+    try:
+        refresh_token = token_cipher().decrypt(
+            connection.encrypted_refresh_token.encode()
+        ).decode()
+    except InvalidToken as exc:
+        raise HTTPException(status_code=503, detail="No se pudo descifrar la conexión Google") from exc
+
+    try:
+        response = httpx.post(
+            "https://oauth2.googleapis.com/token",
+            data={
+                "client_id": GOOGLE_CLIENT_ID,
+                "client_secret": GOOGLE_CLIENT_SECRET,
+                "refresh_token": refresh_token,
+                "grant_type": "refresh_token",
+            },
+            timeout=20,
+        )
+        response.raise_for_status()
+        return response.json()["access_token"]
+    except (httpx.HTTPError, KeyError) as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="Google no pudo renovar la autorización; vuelve a conectar la cuenta",
+        ) from exc
+
+
+def google_get(url: str, access_token: str, params: dict | None = None) -> dict:
+    try:
+        response = httpx.get(
+            url,
+            params=params,
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "X-GOOG-API-FORMAT-VERSION": "2",
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
+        return response.json()
+    except httpx.HTTPStatusError as exc:
+        detail = exc.response.json().get("error", {}).get("message", exc.response.text)
+        raise HTTPException(status_code=502, detail=f"Google Business Profile: {detail}") from exc
+    except (httpx.HTTPError, ValueError) as exc:
+        raise HTTPException(status_code=502, detail="No se pudo consultar Google Business Profile") from exc
+
+
+def format_address(address: dict | None) -> str | None:
+    if not address:
+        return None
+    parts = [
+        *address.get("addressLines", []),
+        address.get("postalCode"),
+        address.get("locality"),
+        address.get("administrativeArea"),
+        address.get("regionCode"),
+    ]
+    return ", ".join(str(part) for part in parts if part)
+
+
+def candidate_from_google(account_name: str, location: dict) -> GoogleLocationCandidate:
+    categories = location.get("categories", {})
+    primary = categories.get("primaryCategory", {})
+    phones = location.get("phoneNumbers", {})
+    return GoogleLocationCandidate(
+        account_name=account_name,
+        location_name=location["name"],
+        title=location.get("title", "Negocio sin nombre"),
+        address=format_address(location.get("storefrontAddress")),
+        phone=phones.get("primaryPhone"),
+        website=location.get("websiteUri"),
+        category=primary.get("displayName"),
+    )
+
+
+def fetch_google_locations(access_token: str) -> list[GoogleLocationCandidate]:
+    accounts_data = google_get(
+        "https://mybusinessaccountmanagement.googleapis.com/v1/accounts",
+        access_token,
+    )
+    candidates: list[GoogleLocationCandidate] = []
+    for account in accounts_data.get("accounts", []):
+        account_name = account.get("name")
+        if not account_name:
+            continue
+        page_token = None
+        while True:
+            params = {
+                "readMask": (
+                    "name,title,storefrontAddress,phoneNumbers,categories,"
+                    "websiteUri,regularHours,metadata,profile"
+                ),
+                "pageSize": 100,
+            }
+            if page_token:
+                params["pageToken"] = page_token
+            data = google_get(
+                f"https://mybusinessbusinessinformation.googleapis.com/v1/{account_name}/locations",
+                access_token,
+                params,
+            )
+            candidates.extend(
+                candidate_from_google(account_name, location)
+                for location in data.get("locations", [])
+            )
+            page_token = data.get("nextPageToken")
+            if not page_token:
+                break
+    return candidates
+
+
+def parse_google_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def sync_reviews(db: Session, ficha: FichaGBP, access_token: str) -> None:
+    parent = f"{ficha.google_account_name}/{ficha.google_location_name}"
+    page_token = None
+    while True:
+        params = {"pageSize": 50}
+        if page_token:
+            params["pageToken"] = page_token
+        data = google_get(
+            f"https://mybusiness.googleapis.com/v4/{parent}/reviews",
+            access_token,
+            params,
+        )
+        for review in data.get("reviews", []):
+            review_id = review.get("reviewId")
+            if not review_id:
+                continue
+            record = (
+                db.query(ReviewRecord)
+                .filter(
+                    ReviewRecord.ficha_id == ficha.id,
+                    ReviewRecord.google_review_id == review_id,
+                )
+                .first()
+            )
+            if not record:
+                record = ReviewRecord(ficha_id=ficha.id, google_review_id=review_id)
+                db.add(record)
+            record.reviewer_name = review.get("reviewer", {}).get("displayName")
+            record.star_rating = review.get("starRating")
+            record.comment = review.get("comment")
+            record.review_reply = review.get("reviewReply", {}).get("comment")
+            record.create_time = parse_google_datetime(review.get("createTime"))
+            record.update_time = parse_google_datetime(review.get("updateTime"))
+        page_token = data.get("nextPageToken")
+        if not page_token:
+            break
+
+
 def get_current_user(
     token: Annotated[str, Depends(oauth2_scheme)],
     db: DbSession,
@@ -199,6 +460,11 @@ def serialize_ficha(ficha: FichaGBP) -> FichaResponse:
         prompt_custom=ficha.prompt_custom,
         tiene_gemini_api_key=bool(ficha.gemini_api_key),
         tiene_gbp_auth_token=bool(ficha.gbp_auth_token),
+        google_conectada=bool(ficha.google_location_name),
+        direccion=ficha.direccion,
+        telefono=ficha.telefono,
+        sitio_web=ficha.sitio_web,
+        fecha_sincronizacion=ficha.fecha_sincronizacion,
         fecha_creacion=ficha.fecha_creacion,
     )
 
@@ -214,12 +480,23 @@ def create_tables() -> None:
     inspector = inspect(engine)
     if "fichas_gbp" in inspector.get_table_names():
         columns = {column["name"] for column in inspector.get_columns("fichas_gbp")}
-        if "owner_id" not in columns:
-            with engine.begin() as connection:
+        legacy_columns = {
+            "owner_id": "INTEGER REFERENCES users(id)",
+            "google_account_name": "VARCHAR(255)",
+            "google_location_name": "VARCHAR(255)",
+            "direccion": "TEXT",
+            "telefono": "VARCHAR(100)",
+            "sitio_web": "TEXT",
+            "google_data": "TEXT",
+            "fecha_sincronizacion": "TIMESTAMP",
+        }
+        with engine.begin() as connection:
+            for column_name, column_type in legacy_columns.items():
+                if column_name in columns:
+                    continue
                 connection.execute(
                     text(
-                        "ALTER TABLE fichas_gbp "
-                        "ADD COLUMN owner_id INTEGER REFERENCES users(id)"
+                        f"ALTER TABLE fichas_gbp ADD COLUMN {column_name} {column_type}"
                     )
                 )
         with engine.begin() as connection:
@@ -227,6 +504,12 @@ def create_tables() -> None:
                 text(
                     "CREATE INDEX IF NOT EXISTS ix_fichas_gbp_owner_id "
                     "ON fichas_gbp (owner_id)"
+                )
+            )
+            connection.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_fichas_gbp_google_location "
+                    "ON fichas_gbp (owner_id, google_location_name)"
                 )
             )
 
@@ -261,20 +544,206 @@ def me(current_user: CurrentUser):
     return current_user
 
 
-@app.post("/api/v1/fichas", response_model=FichaResponse, status_code=201)
-def crear_ficha(ficha: FichaCreate, db: DbSession, current_user: CurrentUser):
-    total = db.query(FichaGBP).filter(FichaGBP.owner_id == current_user.id).count()
-    if total >= MAX_FICHAS_PER_USER:
+@app.get("/api/v1/google/status", response_model=GoogleConnectionStatus)
+def google_status(db: DbSession, current_user: CurrentUser):
+    connection = (
+        db.query(GoogleConnection)
+        .filter(GoogleConnection.user_id == current_user.id)
+        .first()
+    )
+    return GoogleConnectionStatus(connected=bool(connection))
+
+
+@app.get("/api/v1/google/connect")
+def google_connect(current_user: CurrentUser):
+    require_google_settings()
+    oauth_state = jwt.encode(
+        {
+            "sub": str(current_user.id),
+            "purpose": "google_oauth",
+            "exp": datetime.now(timezone.utc) + timedelta(minutes=10),
+        },
+        JWT_SECRET_KEY,
+        algorithm=JWT_ALGORITHM,
+    )
+    query = urlencode(
+        {
+            "client_id": GOOGLE_CLIENT_ID,
+            "redirect_uri": GOOGLE_REDIRECT_URI,
+            "response_type": "code",
+            "scope": GOOGLE_OAUTH_SCOPE,
+            "access_type": "offline",
+            "include_granted_scopes": "true",
+            "prompt": "consent",
+            "state": oauth_state,
+        }
+    )
+    return {"authorization_url": f"https://accounts.google.com/o/oauth2/v2/auth?{query}"}
+
+
+@app.get("/api/v1/google/callback")
+def google_callback(
+    db: DbSession,
+    code: str | None = Query(default=None),
+    state_token: str | None = Query(default=None, alias="state"),
+    error: str | None = Query(default=None),
+):
+    if error:
+        return RedirectResponse(url=f"/?google=error&reason={error}")
+    if not code or not state_token:
+        raise HTTPException(status_code=400, detail="Respuesta OAuth incompleta")
+    require_google_settings()
+    try:
+        state_payload = jwt.decode(
+            state_token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM]
+        )
+        if state_payload.get("purpose") != "google_oauth":
+            raise JWTError("Propósito incorrecto")
+        user_id = int(state_payload["sub"])
+    except (JWTError, KeyError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="Estado OAuth inválido o caducado") from exc
+
+    try:
+        response = httpx.post(
+            "https://oauth2.googleapis.com/token",
+            data={
+                "client_id": GOOGLE_CLIENT_ID,
+                "client_secret": GOOGLE_CLIENT_SECRET,
+                "code": code,
+                "grant_type": "authorization_code",
+                "redirect_uri": GOOGLE_REDIRECT_URI,
+            },
+            timeout=20,
+        )
+        response.raise_for_status()
+        token_data = response.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        raise HTTPException(status_code=502, detail="Google no pudo completar OAuth") from exc
+
+    refresh_token = token_data.get("refresh_token")
+    connection = (
+        db.query(GoogleConnection).filter(GoogleConnection.user_id == user_id).first()
+    )
+    if not refresh_token and not connection:
         raise HTTPException(
-            status_code=409,
-            detail=f"Has alcanzado el límite de {MAX_FICHAS_PER_USER} fichas",
+            status_code=400,
+            detail="Google no entregó refresh_token; revoca el acceso y vuelve a conectar",
+        )
+    if not connection:
+        connection = GoogleConnection(user_id=user_id, encrypted_refresh_token="")
+        db.add(connection)
+    if refresh_token:
+        connection.encrypted_refresh_token = (
+            token_cipher().encrypt(refresh_token.encode()).decode()
+        )
+    connection.scopes = token_data.get("scope")
+    connection.fecha_actualizacion = datetime.utcnow()
+    db.commit()
+    return RedirectResponse(url="/?google=connected")
+
+
+def get_google_connection(db: Session, user_id: int) -> GoogleConnection:
+    connection = (
+        db.query(GoogleConnection).filter(GoogleConnection.user_id == user_id).first()
+    )
+    if not connection:
+        raise HTTPException(status_code=409, detail="Primero debes conectar una cuenta Google")
+    return connection
+
+
+@app.get("/api/v1/google/locations", response_model=list[GoogleLocationCandidate])
+def google_locations(db: DbSession, current_user: CurrentUser):
+    connection = get_google_connection(db, current_user.id)
+    return fetch_google_locations(google_access_token(connection))
+
+
+@app.post("/api/v1/google/import", response_model=list[FichaResponse], status_code=201)
+def import_google_locations(
+    payload: GoogleImportRequest,
+    db: DbSession,
+    current_user: CurrentUser,
+):
+    connection = get_google_connection(db, current_user.id)
+    access_token = google_access_token(connection)
+    available = {
+        (candidate.account_name, candidate.location_name): candidate
+        for candidate in fetch_google_locations(access_token)
+    }
+    requested_keys = {
+        (candidate.account_name, candidate.location_name)
+        for candidate in payload.locations
+    }
+    if len(requested_keys) != len(payload.locations):
+        raise HTTPException(status_code=422, detail="Hay ubicaciones duplicadas")
+    if not requested_keys.issubset(available):
+        raise HTTPException(
+            status_code=403,
+            detail="Una ubicación no pertenece a la cuenta Google conectada",
         )
 
-    nueva_ficha = FichaGBP(owner_id=current_user.id, **ficha.model_dump())
-    db.add(nueva_ficha)
-    db.commit()
-    db.refresh(nueva_ficha)
-    return serialize_ficha(nueva_ficha)
+    existing = (
+        db.query(FichaGBP)
+        .filter(FichaGBP.owner_id == current_user.id)
+        .all()
+    )
+    existing_keys = {
+        (ficha.google_account_name, ficha.google_location_name)
+        for ficha in existing
+        if ficha.google_location_name
+    }
+    new_keys = requested_keys - existing_keys
+    if len(existing) + len(new_keys) > MAX_FICHAS_PER_USER:
+        raise HTTPException(
+            status_code=409,
+            detail=f"La importación supera el límite de {MAX_FICHAS_PER_USER} fichas",
+        )
+
+    imported: list[FichaGBP] = []
+    try:
+        for key in requested_keys:
+            candidate = available[key]
+            ficha = next(
+                (
+                    item
+                    for item in existing
+                    if (item.google_account_name, item.google_location_name) == key
+                ),
+                None,
+            )
+            if not ficha:
+                ficha = FichaGBP(
+                    owner_id=current_user.id,
+                    nombre_negocio=candidate.title,
+                    categoria=candidate.category or "Sin categoría",
+                    ciudad=candidate.address or "Sin ubicación",
+                    gemini_api_key=payload.gemini_api_key,
+                    google_account_name=candidate.account_name,
+                    google_location_name=candidate.location_name,
+                )
+                db.add(ficha)
+                db.flush()
+            ficha.nombre_negocio = candidate.title
+            ficha.categoria = candidate.category or ficha.categoria
+            ficha.direccion = candidate.address
+            ficha.telefono = candidate.phone
+            ficha.sitio_web = candidate.website
+            ficha.gemini_api_key = payload.gemini_api_key
+            ficha.prompt_custom = payload.prompt_custom
+            ficha.google_data = candidate.model_dump_json()
+            ficha.fecha_sincronizacion = datetime.utcnow()
+            sync_reviews(db, ficha, access_token)
+            imported.append(ficha)
+        db.commit()
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="No se pudo completar la importación") from exc
+
+    for ficha in imported:
+        db.refresh(ficha)
+    return [serialize_ficha(ficha) for ficha in imported]
 
 
 @app.get("/api/v1/fichas", response_model=list[FichaResponse])
