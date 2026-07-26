@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SaaS GBP</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="min-h-screen bg-slate-950 text-slate-100">
+  <main class="mx-auto max-w-5xl p-6">
+    <header class="mb-8 flex items-center justify-between">
+      <div>
+        <p class="text-sm font-semibold uppercase tracking-widest text-sky-400">SaaS GBP</p>
+        <h1 class="text-3xl font-bold">Tus fichas de negocio</h1>
+      </div>
+      <button id="logout" class="hidden rounded-lg border border-slate-700 px-4 py-2">Salir</button>
+    </header>
+
+    <section id="auth" class="mx-auto max-w-md rounded-2xl bg-slate-900 p-6 shadow-xl">
+      <h2 id="auth-title" class="mb-5 text-xl font-semibold">Iniciar sesión</h2>
+      <form id="auth-form" class="space-y-4">
+        <input id="email" type="email" required placeholder="Email"
+               class="w-full rounded-lg border border-slate-700 bg-slate-800 px-4 py-3">
+        <input id="password" type="password" required minlength="8" placeholder="Contraseña"
+               class="w-full rounded-lg border border-slate-700 bg-slate-800 px-4 py-3">
+        <button class="w-full rounded-lg bg-sky-500 px-4 py-3 font-semibold text-slate-950">Continuar</button>
+      </form>
+      <button id="toggle-auth" class="mt-4 text-sm text-sky-400">Crear una cuenta</button>
+    </section>
+
+    <section id="dashboard" class="hidden grid gap-6 lg:grid-cols-[360px_1fr]">
+      <form id="ficha-form" class="h-fit space-y-3 rounded-2xl bg-slate-900 p-5">
+        <h2 class="text-xl font-semibold">Nueva ficha</h2>
+        <input name="nombre_negocio" required placeholder="Nombre del negocio" class="field">
+        <input name="categoria" required placeholder="Categoría" class="field">
+        <input name="ciudad" required placeholder="Ciudad" class="field">
+        <input name="gemini_api_key" required type="password" placeholder="Gemini API key" class="field">
+        <textarea name="prompt_custom" placeholder="Prompt personalizado (opcional)" class="field"></textarea>
+        <textarea name="gbp_auth_token" placeholder="Token GBP (opcional)" class="field"></textarea>
+        <button class="w-full rounded-lg bg-sky-500 px-4 py-3 font-semibold text-slate-950">Crear ficha</button>
+        <p class="text-xs text-slate-400">Máximo 5 fichas por cuenta.</p>
+      </form>
+      <div>
+        <p id="message" class="mb-4 hidden rounded-lg p-3"></p>
+        <div id="fichas" class="grid gap-4 sm:grid-cols-2"></div>
+      </div>
+    </section>
+  </main>
+
+  <style type="text/tailwindcss">
+    .field { @apply w-full rounded-lg border border-slate-700 bg-slate-800 px-4 py-3 outline-none focus:border-sky-500; }
+  </style>
+  <script>
+    const state = { register: false, token: localStorage.getItem("access_token") };
+    const auth = document.querySelector("#auth");
+    const dashboard = document.querySelector("#dashboard");
+    const message = document.querySelector("#message");
+
+    function showMessage(text, error = false) {
+      message.textContent = text;
+      message.className = `mb-4 rounded-lg p-3 ${error ? "bg-red-950 text-red-300" : "bg-emerald-950 text-emerald-300"}`;
+    }
+
+    async function api(path, options = {}) {
+      const headers = { "Content-Type": "application/json", ...(options.headers || {}) };
+      if (state.token) headers.Authorization = `Bearer ${state.token}`;
+      const response = await fetch(path, { ...options, headers });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.detail || "Ha ocurrido un error");
+      return data;
+    }
+
+    async function loadFichas() {
+      try {
+        const fichas = await api("/api/v1/fichas");
+        document.querySelector("#fichas").innerHTML = fichas.length
+          ? fichas.map(f => `<article class="rounded-2xl bg-slate-900 p-5">
+              <h3 class="font-semibold">${escapeHtml(f.nombre_negocio)}</h3>
+              <p class="text-sm text-slate-400">${escapeHtml(f.categoria)} · ${escapeHtml(f.ciudad)}</p>
+              <p class="mt-3 text-xs text-slate-500">Gemini: ${f.tiene_gemini_api_key ? "configurado" : "pendiente"}</p>
+            </article>`).join("")
+          : '<p class="text-slate-400">Todavía no tienes fichas.</p>';
+      } catch (error) {
+        logout();
+      }
+    }
+
+    function escapeHtml(value) {
+      const node = document.createElement("div");
+      node.textContent = value;
+      return node.innerHTML;
+    }
+
+    function render() {
+      auth.classList.toggle("hidden", Boolean(state.token));
+      dashboard.classList.toggle("hidden", !state.token);
+      document.querySelector("#logout").classList.toggle("hidden", !state.token);
+      if (state.token) loadFichas();
+    }
+
+    function logout() {
+      state.token = null;
+      localStorage.removeItem("access_token");
+      render();
+    }
+
+    document.querySelector("#toggle-auth").addEventListener("click", () => {
+      state.register = !state.register;
+      document.querySelector("#auth-title").textContent = state.register ? "Crear cuenta" : "Iniciar sesión";
+      document.querySelector("#toggle-auth").textContent = state.register ? "Ya tengo una cuenta" : "Crear una cuenta";
+    });
+
+    document.querySelector("#auth-form").addEventListener("submit", async event => {
+      event.preventDefault();
+      try {
+        const data = await api(`/api/v1/auth/${state.register ? "register" : "login"}`, {
+          method: "POST",
+          body: JSON.stringify({
+            email: document.querySelector("#email").value,
+            password: document.querySelector("#password").value
+          })
+        });
+        state.token = data.access_token;
+        localStorage.setItem("access_token", data.access_token);
+        render();
+      } catch (error) {
+        alert(error.message);
+      }
+    });
+
+    document.querySelector("#ficha-form").addEventListener("submit", async event => {
+      event.preventDefault();
+      const form = new FormData(event.currentTarget);
+      const payload = Object.fromEntries(form.entries());
+      for (const key of ["prompt_custom", "gbp_auth_token"]) if (!payload[key]) payload[key] = null;
+      try {
+        await api("/api/v1/fichas", { method: "POST", body: JSON.stringify(payload) });
+        event.currentTarget.reset();
+        showMessage("Ficha creada correctamente");
+        await loadFichas();
+      } catch (error) {
+        showMessage(error.message, true);
+      }
+    });
+
+    document.querySelector("#logout").addEventListener("click", logout);
+    render();
+  </script>
+</body>
+</html>
