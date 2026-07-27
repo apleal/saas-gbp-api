@@ -13,6 +13,7 @@ publicaciones con la clave de Gemini de cada ficha.
 - `GOOGLE_CLIENT_SECRET`: secreto del cliente OAuth.
 - `GOOGLE_REDIRECT_URI`: callback OAuth público y autorizado en Google Cloud.
 - `TOKEN_ENCRYPTION_KEY`: clave Fernet para cifrar los refresh tokens.
+- `LOG_LEVEL`: nivel de log (`INFO` por defecto).
 
 Genera un secreto seguro, por ejemplo:
 
@@ -31,10 +32,15 @@ El panel se sirve en `/` y la documentación OpenAPI en `/docs`.
 
 ## Importación desde Google Business Profile
 
-El usuario conecta la cuenta Google que administra sus negocios. La aplicación
-consulta sus cuentas y ubicaciones, permite seleccionar hasta cinco e importa
+El usuario puede conectar varias cuentas de correo de Google y elegir cuál
+administra cada negocio. La aplicación consulta sus cuentas y ubicaciones,
+permite seleccionar hasta cinco e importa
 los datos del perfil y sus reseñas. Los tokens de acceso se renuevan en el
 servidor y el refresh token nunca se expone al navegador.
+
+El panel muestra el detalle que devuelve la API. Los errores internos incluyen
+una referencia que también aparece en el log del servidor para poder localizar
+el traceback sin exponer secretos al navegador.
 
 ## Despliegue de la versión multitenant
 

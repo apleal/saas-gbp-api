@@ -35,8 +35,9 @@
           <p class="mt-1 text-sm text-slate-400">Conecta la cuenta que administra tus perfiles de Google.</p>
         </div>
         <button id="google-connect" class="w-full rounded-lg bg-white px-4 py-3 font-semibold text-slate-950">
-          Conectar con Google
+          Añadir cuenta de Google
         </button>
+        <div id="google-accounts" class="space-y-2"></div>
         <form id="import-form" class="hidden space-y-3">
           <div id="google-locations" class="max-h-72 space-y-2 overflow-y-auto"></div>
           <input name="gemini_api_key" required type="password" placeholder="Gemini API key" class="field">
@@ -58,7 +59,7 @@
     .field { @apply w-full rounded-lg border border-slate-700 bg-slate-800 px-4 py-3 outline-none focus:border-sky-500; }
   </style>
   <script>
-    const state = { register: false, token: localStorage.getItem("access_token") };
+    const state = { register: false, token: localStorage.getItem("access_token"), connectionId: null };
     const auth = document.querySelector("#auth");
     const dashboard = document.querySelector("#dashboard");
     const message = document.querySelector("#message");
@@ -73,7 +74,14 @@
       if (state.token) headers.Authorization = `Bearer ${state.token}`;
       const response = await fetch(path, { ...options, headers });
       const data = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(data.detail || "Ha ocurrido un error");
+      if (!response.ok) {
+        const detail = Array.isArray(data.detail)
+          ? data.detail.map(item => item.msg || JSON.stringify(item)).join("; ")
+          : data.detail;
+        const error = new Error(detail || `Error ${response.status}: ${response.statusText}`);
+        error.status = response.status;
+        throw error;
+      }
       return data;
     }
 
@@ -86,10 +94,12 @@
               <p class="text-sm text-slate-400">${escapeHtml(f.categoria)} · ${escapeHtml(f.ciudad)}</p>
               ${f.direccion ? `<p class="mt-2 text-xs text-slate-500">${escapeHtml(f.direccion)}</p>` : ""}
               <p class="mt-3 text-xs text-slate-500">Google: ${f.google_conectada ? "conectado" : "pendiente"} · Gemini: ${f.tiene_gemini_api_key ? "configurado" : "pendiente"}</p>
+              <button data-delete-ficha="${f.id}" class="mt-4 text-sm text-red-400">Borrar ficha</button>
             </article>`).join("")
           : '<p class="text-slate-400">Todavía no tienes fichas.</p>';
       } catch (error) {
-        logout();
+        if (error.status === 401) logout();
+        else showMessage(error.message, true);
       }
     }
 
@@ -142,17 +152,29 @@
     async function loadGoogleStatus() {
       try {
         const status = await api("/api/v1/google/status");
-        if (status.connected) await loadGoogleLocations();
+        if (!state.connectionId && status.accounts.length) state.connectionId = status.accounts[0].id;
+        document.querySelector("#google-accounts").innerHTML = status.accounts.map(account => `
+          <div class="flex items-center gap-2 rounded-lg border border-slate-700 p-2">
+            <button data-account="${account.id}" class="min-w-0 flex-1 truncate text-left text-sm ${state.connectionId === account.id ? "text-sky-400" : ""}">
+              ${escapeHtml(account.email)}
+            </button>
+            <button data-delete-account="${account.id}" class="px-2 text-red-400" title="Desconectar">×</button>
+          </div>`).join("");
+        if (status.accounts.some(account => account.id === state.connectionId)) {
+          await loadGoogleLocations();
+        } else {
+          state.connectionId = null;
+          document.querySelector("#import-form").classList.add("hidden");
+        }
       } catch (error) {
         showMessage(error.message, true);
       }
     }
 
     async function loadGoogleLocations() {
-      const button = document.querySelector("#google-connect");
-      button.textContent = "Actualizar conexión con Google";
+      if (!state.connectionId) return;
       try {
-        const locations = await api("/api/v1/google/locations");
+        const locations = await api(`/api/v1/google/locations?connection_id=${state.connectionId}`);
         const container = document.querySelector("#google-locations");
         container.innerHTML = locations.length
           ? locations.map((location, index) => `<label class="flex cursor-pointer gap-3 rounded-lg border border-slate-700 p-3">
@@ -189,6 +211,7 @@
         await api("/api/v1/google/import", {
           method: "POST",
           body: JSON.stringify({
+            connection_id: state.connectionId,
             locations: selected,
             gemini_api_key: form.get("gemini_api_key"),
             prompt_custom: form.get("prompt_custom") || null
@@ -202,8 +225,46 @@
     });
 
     document.querySelector("#logout").addEventListener("click", logout);
-    const googleResult = new URLSearchParams(location.search).get("google");
-    if (googleResult) history.replaceState({}, "", "/");
+    document.querySelector("#google-accounts").addEventListener("click", async event => {
+      const accountButton = event.target.closest("[data-account]");
+      if (accountButton) {
+        state.connectionId = Number(accountButton.dataset.account);
+        await loadGoogleStatus();
+      }
+      const deleteButton = event.target.closest("[data-delete-account]");
+      if (deleteButton && confirm("¿Desconectar esta cuenta? Las fichas se conservarán.")) {
+        try {
+          await api(`/api/v1/google/connections/${deleteButton.dataset.deleteAccount}`, { method: "DELETE" });
+          if (state.connectionId === Number(deleteButton.dataset.deleteAccount)) state.connectionId = null;
+          showMessage("Cuenta de Google desconectada");
+          await loadGoogleStatus();
+        } catch (error) {
+          showMessage(error.message, true);
+        }
+      }
+    });
+    document.querySelector("#fichas").addEventListener("click", async event => {
+      const button = event.target.closest("[data-delete-ficha]");
+      if (!button || !confirm("¿Borrar esta ficha y todos sus datos asociados?")) return;
+      try {
+        await api(`/api/v1/fichas/${button.dataset.deleteFicha}`, { method: "DELETE" });
+        showMessage("Ficha borrada");
+        await loadFichas();
+      } catch (error) {
+        showMessage(error.message, true);
+      }
+    });
+    const googleParams = new URLSearchParams(location.search);
+    const googleResult = googleParams.get("google");
+    if (googleResult) {
+      setTimeout(() => showMessage(
+        googleResult === "connected"
+          ? "Cuenta de Google conectada correctamente"
+          : `No se pudo conectar Google: ${googleParams.get("reason") || "error desconocido"}`,
+        googleResult !== "connected"
+      ));
+      history.replaceState({}, "", "/");
+    }
     render();
   </script>
 </body>
