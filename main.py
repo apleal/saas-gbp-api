@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import time
 import uuid
 from urllib.parse import urlencode
 from datetime import datetime, timedelta, timezone
@@ -317,23 +318,57 @@ def google_access_token(connection: GoogleConnection) -> str:
 
 
 def google_get(url: str, access_token: str, params: dict | None = None) -> dict:
-    try:
-        response = httpx.get(
-            url,
-            params=params,
-            headers={
-                "Authorization": f"Bearer {access_token}",
-                "X-GOOG-API-FORMAT-VERSION": "2",
-            },
-            timeout=30,
-        )
-        response.raise_for_status()
-        return response.json()
-    except httpx.HTTPStatusError as exc:
-        detail = exc.response.json().get("error", {}).get("message", exc.response.text)
-        raise HTTPException(status_code=502, detail=f"Google Business Profile: {detail}") from exc
-    except (httpx.HTTPError, ValueError) as exc:
-        raise HTTPException(status_code=502, detail="No se pudo consultar Google Business Profile") from exc
+    endpoint = url.split("?", 1)[0]
+    for attempt in range(1, 4):
+        try:
+            response = httpx.get(
+                url,
+                params=params,
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "X-GOOG-API-FORMAT-VERSION": "2",
+                },
+                timeout=30,
+            )
+            if response.status_code == 429 and attempt < 3:
+                retry_after = response.headers.get("Retry-After", "")
+                delay = min(float(retry_after), 10) if retry_after.isdigit() else 2 ** (attempt - 1)
+                logger.warning(
+                    "Google rate limit endpoint=%s attempt=%s retry_in=%ss",
+                    endpoint,
+                    attempt,
+                    delay,
+                )
+                time.sleep(delay)
+                continue
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as exc:
+            detail = public_error_detail(exc)
+            logger.warning(
+                "Google request failed endpoint=%s status=%s detail=%s",
+                endpoint,
+                exc.response.status_code,
+                detail,
+            )
+            if exc.response.status_code == 429:
+                raise HTTPException(
+                    status_code=429,
+                    detail=(
+                        "Google ha limitado temporalmente las consultas. "
+                        "Espera un minuto y vuelve a intentarlo."
+                    ),
+                ) from exc
+            raise HTTPException(
+                status_code=502, detail=f"Google Business Profile: {detail}"
+            ) from exc
+        except (httpx.HTTPError, ValueError) as exc:
+            logger.exception("Google request error endpoint=%s", endpoint)
+            raise HTTPException(
+                status_code=502,
+                detail="No se pudo consultar Google Business Profile",
+            ) from exc
+    raise HTTPException(status_code=429, detail="Google ha limitado temporalmente las consultas")
 
 
 def public_error_detail(exc: Exception) -> str:
@@ -563,6 +598,37 @@ def create_tables() -> None:
                 text(
                     "CREATE INDEX IF NOT EXISTS ix_fichas_gbp_google_connection_id "
                     "ON fichas_gbp (google_connection_id)"
+                )
+            )
+    # Algunas instalaciones antiguas tienen historial_posts con un esquema
+    # previo. create_all no añade columnas a tablas que ya existen.
+    if "historial_posts" in inspector.get_table_names():
+        post_columns = {
+            column["name"] for column in inspector.get_columns("historial_posts")
+        }
+        legacy_post_columns = {
+            "ficha_id": "INTEGER REFERENCES fichas_gbp(id)",
+            "keywords": "VARCHAR(255)",
+            "post_1_text": "TEXT",
+            "post_2_text": "TEXT",
+            "fecha_creacion": "TIMESTAMP",
+        }
+        with engine.begin() as connection:
+            for column_name, column_type in legacy_post_columns.items():
+                if column_name not in post_columns:
+                    logger.warning(
+                        "Migrating historial_posts: adding column=%s", column_name
+                    )
+                    connection.execute(
+                        text(
+                            f"ALTER TABLE historial_posts "
+                            f"ADD COLUMN {column_name} {column_type}"
+                        )
+                    )
+            connection.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_historial_posts_ficha_id "
+                    "ON historial_posts (ficha_id)"
                 )
             )
     # Migra la conexión única de versiones anteriores al modelo multi-cuenta.
