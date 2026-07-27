@@ -10,7 +10,7 @@ from typing import Annotated, Generator
 import httpx
 from cryptography.fernet import Fernet, InvalidToken
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse, Response
 from fastapi.security import OAuth2PasswordBearer
 from fastapi.staticfiles import StaticFiles
 from google import genai
@@ -786,6 +786,7 @@ def delete_google_connection(
     ).update({FichaGBP.google_connection_id: None}, synchronize_session=False)
     db.delete(connection)
     db.commit()
+    return Response(status_code=204)
 
 
 @app.post("/api/v1/google/import", response_model=list[FichaResponse], status_code=201)
@@ -906,8 +907,21 @@ def borrar_ficha(ficha_id: int, db: DbSession, current_user: CurrentUser):
     )
     if not ficha:
         raise HTTPException(status_code=404, detail="Ficha GBP no encontrada")
-    db.delete(ficha)
-    db.commit()
+    try:
+        # El borrado explícito funciona también con bases antiguas cuyas claves
+        # foráneas no se crearon con ON DELETE CASCADE.
+        db.query(PostRecord).filter(PostRecord.ficha_id == ficha.id).delete(
+            synchronize_session=False
+        )
+        db.query(ReviewRecord).filter(ReviewRecord.ficha_id == ficha.id).delete(
+            synchronize_session=False
+        )
+        db.delete(ficha)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    return Response(status_code=204)
 
 
 @app.post(
